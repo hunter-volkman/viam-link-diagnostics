@@ -1,0 +1,29 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "hunter:connectivity",
+  "visibility": "private",
+  "url": "https://github.com/hunter-volkman/viam-connectivity",
+  "description": "Sensor component for Wi-Fi or Ethernet link",
+  "models": [
+    {
+      "api": "rdk:component:sensor",
+      "model": "hunter:connectivity:sensor",
+      "short_description": "Provide a short (100 characters or less) description of this model here",
+      "markdown_link": "README.md#model-hunterconnectivitysensor"
+    }
+  ],
+  "applications": null,
+  "markdown_link": "README.md",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/arm64",
+      "darwin/arm64"
+    ],
+    "darwin_deps": []
+  },
+  "entrypoint": "bin/module"
+}
