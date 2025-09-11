@@ -189,37 +189,20 @@ func (s *connectivitySensor) collectReading(ctx context.Context) *Reading {
 		reading.IfaceType = s.detectInterfaceType(iface)
 	}
 
-	// Collect common network info in parallel
-	var wg sync.WaitGroup
+	// Collect network info FIRST (not in parallel to avoid race conditions)
+	s.collectNetworkInfo(ctx, reading)
 
-	// Basic network info
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.collectNetworkInfo(ctx, reading)
-	}()
-
-	// NetworkManager state
-	if s.cfg.NMCli {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			reading.NMState = s.getNMState(ctx, iface)
-		}()
-	}
-
-	// Wi-Fi specific
+	// Then collect Wi-Fi info if applicable
 	if reading.IfaceType == "wifi" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.collectWiFiInfo(ctx, reading)
-		}()
+		s.collectWiFiInfo(ctx, reading)
 	}
 
-	wg.Wait()
+	// Then get NetworkManager state if enabled
+	if s.cfg.NMCli {
+		reading.NMState = s.getNMState(ctx, iface)
+	}
 
-	// Probes (sequential to avoid flooding)
+	// Finally do probes
 	if reading.GatewayIP != nil && *reading.GatewayIP != "" {
 		latency, loss := s.probe(ctx, *reading.GatewayIP)
 		reading.LatencyGwMs = latency
@@ -231,6 +214,9 @@ func (s *connectivitySensor) collectReading(ctx context.Context) *Reading {
 	reading.LatencyInetMs = latency
 	reading.LossInetPct = loss
 
+	// Determine route based on probe results
+	reading.Route = determineRoute(reading.LossGwPct, reading.LossInetPct)
+
 	return reading
 }
 
@@ -239,7 +225,8 @@ func (s *connectivitySensor) getDefaultInterface() string {
 	routes, err := netlink.RouteList(nil, 4)
 	if err == nil {
 		for _, route := range routes {
-			if route.Dst == nil { // default route
+			// Default route has nil or 0.0.0.0/0 destination
+			if route.Dst == nil || (route.Dst != nil && route.Dst.String() == "0.0.0.0/0") {
 				if route.LinkIndex > 0 {
 					link, err := netlink.LinkByIndex(route.LinkIndex)
 					if err == nil {
@@ -265,22 +252,6 @@ func (s *connectivitySensor) getDefaultInterface() string {
 		}
 	}
 
-	// macOS fallback - use route command
-	out, err = exec.CommandContext(ctx, "route", "-n", "get", "default").Output()
-	if err == nil {
-		// Parse macOS route output for interface
-		lines := strings.Split(string(out), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "interface:") {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					return parts[1]
-				}
-			}
-		}
-	}
-
 	return "unknown"
 }
 
@@ -302,9 +273,12 @@ func (s *connectivitySensor) collectNetworkInfo(ctx context.Context, reading *Re
 	// Get interface details via netlink
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
-		s.logger.Debugw("failed to get link", "iface", iface, "error", err)
+		s.logger.Debugw("failed to get link, using fallback", "iface", iface, "error", err)
+		s.collectNetworkInfoFallback(ctx, reading)
 		return
 	}
+
+	linkIndex := link.Attrs().Index
 
 	// Get addresses
 	addrs, err := netlink.AddrList(link, 0) // 0 = all families
@@ -320,21 +294,103 @@ func (s *connectivitySensor) collectNetworkInfo(ctx context.Context, reading *Re
 		}
 	}
 
-	// Get ALL routes to find the default gateway (not interface-specific)
-	routes, err := netlink.RouteList(nil, 4) // nil = all interfaces, 4 = IPv4
-	if err == nil {
-		for _, route := range routes {
-			if route.Dst == nil && route.Gw != nil { // default route with gateway
+	// Get ALL routes to find the default gateway
+	routes, err := netlink.RouteList(nil, 4)
+	if err != nil {
+		s.logger.Debugw("failed to get routes via netlink", "error", err)
+		s.collectNetworkInfoFallback(ctx, reading)
+		return
+	}
+
+	// Find default route for our interface
+	for _, route := range routes {
+		// Default route has nil Dst or 0.0.0.0/0
+		if route.Dst == nil || (route.Dst != nil && route.Dst.String() == "0.0.0.0/0") {
+			// Check if this route is for our interface
+			if route.LinkIndex == linkIndex {
 				reading.DefaultRoute = true
-				gwStr := route.Gw.String()
-				reading.GatewayIP = &gwStr
+				if route.Gw != nil {
+					gwStr := route.Gw.String()
+					reading.GatewayIP = &gwStr
+					s.logger.Debugw("found default route", "gateway", gwStr, "interface", iface)
+				}
 				break
 			}
 		}
 	}
 
+	// If netlink didn't find the route, fallback to shell
+	if reading.GatewayIP == nil {
+		s.logger.Debugw("netlink didn't find gateway, trying shell fallback")
+		s.collectNetworkInfoFallback(ctx, reading)
+	}
+
 	// Get DNS servers from resolv.conf
 	reading.DNSServers = s.getDNSServers()
+}
+
+func (s *connectivitySensor) collectNetworkInfoFallback(ctx context.Context, reading *Reading) {
+	iface := reading.Iface
+
+	// Get IP addresses using ip command
+	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx2, "ip", "addr", "show", iface)
+	out, err := cmd.Output()
+	if err == nil {
+		output := string(out)
+
+		// Parse IPv4: inet 10.1.5.204/20
+		if match := regexp.MustCompile(`inet\s+([0-9.]+)/\d+`).FindStringSubmatch(output); len(match) > 1 && reading.IPv4 == nil {
+			ipv4 := match[1]
+			reading.IPv4 = &ipv4
+		}
+
+		// Parse IPv6: inet6 fe80::...
+		if match := regexp.MustCompile(`inet6\s+([0-9a-f:]+)/\d+`).FindStringSubmatch(output); len(match) > 1 && reading.IPv6 == nil {
+			ipv6 := match[1]
+			reading.IPv6 = &ipv6
+		}
+	}
+
+	// Get default route and gateway
+	ctx3, cancel2 := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel2()
+
+	// Try to get default route for this specific interface
+	cmd = exec.CommandContext(ctx3, "ip", "route", "show", "default", "dev", iface)
+	out, err = cmd.Output()
+	if err == nil && len(out) > 0 {
+		output := string(out)
+		// Parse: default via 10.1.1.1 dev wlan0
+		if match := regexp.MustCompile(`default\s+via\s+([0-9.]+)`).FindStringSubmatch(output); len(match) > 1 {
+			gwStr := match[1]
+			reading.GatewayIP = &gwStr
+			reading.DefaultRoute = true
+			s.logger.Debugw("found gateway via shell", "gateway", gwStr, "interface", iface)
+		}
+	}
+
+	// If that didn't work, try without specifying device
+	if reading.GatewayIP == nil {
+		ctx4, cancel3 := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel3()
+
+		cmd = exec.CommandContext(ctx4, "ip", "route", "show", "default")
+		out, err = cmd.Output()
+		if err == nil {
+			output := string(out)
+			// Check if it's for our interface
+			if strings.Contains(output, "dev "+iface) {
+				if match := regexp.MustCompile(`default\s+via\s+([0-9.]+)`).FindStringSubmatch(output); len(match) > 1 {
+					gwStr := match[1]
+					reading.GatewayIP = &gwStr
+					reading.DefaultRoute = true
+				}
+			}
+		}
+	}
 }
 
 func (s *connectivitySensor) getDNSServers() []string {
@@ -383,27 +439,47 @@ func (s *connectivitySensor) getNMState(ctx context.Context, iface string) *stri
 
 func (s *connectivitySensor) collectWiFiInfo(ctx context.Context, reading *Reading) {
 	iface := reading.Iface
+	s.logger.Debugw("starting Wi-Fi collection", "interface", iface)
 
 	// Get link info via iw
 	cmd := exec.CommandContext(ctx, "iw", "dev", iface, "link")
 	out, err := cmd.Output()
 	if err != nil {
-		s.logger.Debugw("iw link failed", "error", err)
+		s.logger.Debugw("iw link failed, trying fallback", "error", err)
+
+		// Try iwconfig as fallback
+		cmd2 := exec.CommandContext(ctx, "iwconfig", iface)
+		out2, err2 := cmd2.Output()
+		if err2 == nil {
+			s.logger.Debugw("using iwconfig fallback")
+			s.parseIwconfig(string(out2), reading)
+		} else {
+			s.logger.Debugw("iwconfig also failed", "error", err2)
+		}
 		return
 	}
 
 	linkInfo := string(out)
+	s.logger.Debugw("got iw link output", "length", len(linkInfo))
+
+	// Check if actually connected
+	if strings.Contains(linkInfo, "Not connected") {
+		s.logger.Debugw("Wi-Fi interface not connected", "iface", iface)
+		return
+	}
 
 	// Parse BSSID - Connected to XX:XX:XX:XX:XX:XX
 	if match := regexp.MustCompile(`Connected to ([0-9a-fA-F:]+)`).FindStringSubmatch(linkInfo); len(match) > 1 {
 		bssid := match[1]
 		reading.BSSID = &bssid
+		s.logger.Debugw("parsed BSSID", "bssid", bssid)
 	}
 
-	// Parse SSID - appears after "SSID:"
+	// Parse SSID
 	if match := regexp.MustCompile(`SSID:\s*(.+)`).FindStringSubmatch(linkInfo); len(match) > 1 {
 		ssid := strings.TrimSpace(match[1])
 		reading.SSID = &ssid
+		s.logger.Debugw("parsed SSID", "ssid", ssid)
 	}
 
 	// Parse frequency
@@ -412,29 +488,33 @@ func (s *connectivitySensor) collectWiFiInfo(ctx context.Context, reading *Readi
 			channel, band := s.freqToChannelBand(freq)
 			reading.Channel = &channel
 			reading.BandGHz = &band
+			s.logger.Debugw("parsed frequency", "freq", freq, "channel", channel, "band", band)
 		}
 	}
 
-	// Parse signal strength from link output
+	// Parse signal
 	if match := regexp.MustCompile(`signal:\s*(-?\d+)\s*dBm`).FindStringSubmatch(linkInfo); len(match) > 1 {
 		if rssi, err := strconv.Atoi(match[1]); err == nil {
 			reading.RSSIDbm = &rssi
 			quality := s.rssiToQuality(rssi)
 			reading.LinkQualityPct = &quality
+			s.logger.Debugw("parsed signal", "rssi", rssi, "quality", quality)
 		}
 	}
 
-	// Parse tx bitrate from link output
+	// Parse tx bitrate
 	if match := regexp.MustCompile(`tx bitrate:\s*([\d.]+)\s*MBit/s`).FindStringSubmatch(linkInfo); len(match) > 1 {
 		if rate, err := strconv.ParseFloat(match[1], 64); err == nil {
 			reading.TxBitrateMbps = &rate
+			s.logger.Debugw("parsed tx bitrate", "rate", rate)
 		}
 	}
 
-	// Parse rx bitrate from link output
+	// Parse rx bitrate
 	if match := regexp.MustCompile(`rx bitrate:\s*([\d.]+)\s*MBit/s`).FindStringSubmatch(linkInfo); len(match) > 1 {
 		if rate, err := strconv.ParseFloat(match[1], 64); err == nil {
 			reading.RxBitrateMbps = &rate
+			s.logger.Debugw("parsed rx bitrate", "rate", rate)
 		}
 	}
 
@@ -444,11 +524,13 @@ func (s *connectivitySensor) collectWiFiInfo(ctx context.Context, reading *Readi
 		out, err = cmd.Output()
 		if err == nil {
 			stationInfo := string(out)
+			s.logger.Debugw("got station info", "length", len(stationInfo))
 
 			// Parse tx failed as retries
 			if match := regexp.MustCompile(`tx failed:\s*(\d+)`).FindStringSubmatch(stationInfo); len(match) > 1 {
 				if retries, err := strconv.Atoi(match[1]); err == nil {
 					reading.TxRetries = &retries
+					s.logger.Debugw("parsed tx retries", "retries", retries)
 				}
 			}
 
@@ -457,8 +539,60 @@ func (s *connectivitySensor) collectWiFiInfo(ctx context.Context, reading *Readi
 				if secs, err := strconv.Atoi(match[1]); err == nil {
 					assocTime := time.Now().Add(-time.Duration(secs) * time.Second).UTC().Format(time.RFC3339)
 					reading.LastAssocTs = &assocTime
+					s.logger.Debugw("parsed connected time", "seconds", secs)
 				}
 			}
+		}
+	}
+}
+
+func (s *connectivitySensor) parseIwconfig(output string, reading *Reading) {
+	// ESSID:"NetworkName"
+	if match := regexp.MustCompile(`ESSID:"([^"]+)"`).FindStringSubmatch(output); len(match) > 1 {
+		ssid := match[1]
+		reading.SSID = &ssid
+	}
+
+	// Access Point: AA:BB:CC:DD:EE:FF
+	if match := regexp.MustCompile(`Access Point:\s*([0-9A-Fa-f:]+)`).FindStringSubmatch(output); len(match) > 1 {
+		bssid := match[1]
+		reading.BSSID = &bssid
+	}
+
+	// Signal level=-45 dBm
+	if match := regexp.MustCompile(`Signal level=(-?\d+)\s*dBm`).FindStringSubmatch(output); len(match) > 1 {
+		if rssi, err := strconv.Atoi(match[1]); err == nil {
+			reading.RSSIDbm = &rssi
+			quality := s.rssiToQuality(rssi)
+			reading.LinkQualityPct = &quality
+		}
+	}
+
+	// Link Quality=65/70
+	if match := regexp.MustCompile(`Link Quality=(\d+)/(\d+)`).FindStringSubmatch(output); len(match) > 2 {
+		if current, err := strconv.Atoi(match[1]); err == nil {
+			if max, err := strconv.Atoi(match[2]); err == nil && max > 0 {
+				quality := (current * 100) / max
+				reading.LinkQualityPct = &quality
+			}
+		}
+	}
+
+	// Frequency:5.18 GHz
+	if match := regexp.MustCompile(`Frequency:([\d.]+)\s*GHz`).FindStringSubmatch(output); len(match) > 1 {
+		if ghz, err := strconv.ParseFloat(match[1], 64); err == nil {
+			reading.BandGHz = &ghz
+			// Approximate channel from frequency
+			freq := int(ghz * 1000)
+			channel, _ := s.freqToChannelBand(freq)
+			reading.Channel = &channel
+		}
+	}
+
+	// Bit Rate=72.2 Mb/s
+	if match := regexp.MustCompile(`Bit Rate[=:]([\d.]+)\s*Mb/s`).FindStringSubmatch(output); len(match) > 1 {
+		if rate, err := strconv.ParseFloat(match[1], 64); err == nil {
+			reading.TxBitrateMbps = &rate
 		}
 	}
 }
@@ -478,7 +612,17 @@ func (s *connectivitySensor) freqToChannelBand(freq int) (channel int, band floa
 	// 5 GHz band
 	if freq >= 5180 && freq <= 5825 {
 		band = float64(freq) / 1000.0
-		channel = (freq-5180)/5 + 36
+		// Fix channel calculation for 5GHz
+		if freq >= 5180 && freq <= 5320 {
+			// Channels 36-64
+			channel = (freq-5180)/5 + 36
+		} else if freq >= 5500 && freq <= 5720 {
+			// Channels 100-144
+			channel = (freq-5500)/5 + 100
+		} else if freq >= 5745 && freq <= 5825 {
+			// Channels 149-165
+			channel = (freq-5745)/5 + 149
+		}
 		return
 	}
 
@@ -593,7 +737,6 @@ func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]inter
 	if cmdName, ok := cmd["command"].(string); ok {
 		switch cmdName {
 		case "debug":
-			// Run all diagnostic commands and return raw outputs
 			debug := make(map[string]interface{})
 
 			// Get config and detected interface
@@ -604,51 +747,40 @@ func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]inter
 			}
 			debug["detected_interface"] = iface
 
-			// Run diagnostic commands
+			// Run comprehensive diagnostic commands
 			commands := []struct {
 				name string
 				args []string
 			}{
+				// Network basics
 				{"ip_route_default", []string{"ip", "route", "show", "default"}},
+				{"ip_route_all", []string{"ip", "route", "show"}},
 				{"ip_addr_show", []string{"ip", "addr", "show"}},
 				{"ip_link_show", []string{"ip", "link", "show"}},
-				{"route_get_default", []string{"route", "-n", "get", "default"}},
-				{"ifconfig_all", []string{"ifconfig"}},
-				{"netstat_rn", []string{"netstat", "-rn"}},
+
+				// DNS
 				{"cat_resolv_conf", []string{"cat", "/etc/resolv.conf"}},
+
+				// System network info
 				{"ls_sys_class_net", []string{"ls", "-la", "/sys/class/net/"}},
 			}
 
-			for _, c := range commands {
-				func() {
-					ctx2, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-					defer cancel()
-
-					out, err := exec.CommandContext(ctx2, c.args[0], c.args[1:]...).CombinedOutput()
-
-					result := make(map[string]interface{})
-					result["command"] = strings.Join(c.args, " ")
-					if err != nil {
-						result["error"] = err.Error()
-					}
-					result["output"] = string(out)
-					debug[c.name] = result
-				}()
-			}
-
-			// If we have a specific interface, try interface-specific commands
+			// Interface-specific commands
 			if iface != "" && iface != "unknown" {
-				ifaceCommands := []struct {
-					name string
-					args []string
-				}{
-					{"ifconfig_iface", []string{"ifconfig", iface}},
-					{"ip_addr_show_iface", []string{"ip", "addr", "show", iface}},
-				}
+				commands = append(commands,
+					struct {
+						name string
+						args []string
+					}{"ip_addr_show_iface", []string{"ip", "addr", "show", iface}},
+					struct {
+						name string
+						args []string
+					}{"ip_route_dev", []string{"ip", "route", "show", "dev", iface}},
+				)
 
-				// Wi-Fi specific commands
+				// Wi-Fi specific
 				if strings.HasPrefix(iface, "wlan") || strings.HasPrefix(iface, "wl") {
-					ifaceCommands = append(ifaceCommands,
+					commands = append(commands,
 						struct {
 							name string
 							args []string
@@ -668,8 +800,8 @@ func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]inter
 					)
 				}
 
-				// NetworkManager commands
-				ifaceCommands = append(ifaceCommands,
+				// NetworkManager
+				commands = append(commands,
 					struct {
 						name string
 						args []string
@@ -679,44 +811,117 @@ func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]inter
 						args []string
 					}{"nmcli_con_show", []string{"nmcli", "-t", "con", "show"}},
 				)
-
-				for _, c := range ifaceCommands {
-					func() {
-						ctx2, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-						defer cancel()
-
-						out, err := exec.CommandContext(ctx2, c.args[0], c.args[1:]...).CombinedOutput()
-
-						result := make(map[string]interface{})
-						result["command"] = strings.Join(c.args, " ")
-						if err != nil {
-							result["error"] = err.Error()
-						}
-						result["output"] = string(out)
-						debug[c.name] = result
-					}()
-				}
 			}
 
-			// Test ping
-			pingTargets := []string{"127.0.0.1", s.cfg.InternetHost, "8.8.8.8"}
-			for _, target := range pingTargets {
+			// Execute all commands
+			for _, c := range commands {
 				func() {
 					ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 					defer cancel()
 
-					out, err := exec.CommandContext(ctx2, "ping", "-c", "1", "-W", "1", target).CombinedOutput()
+					out, err := exec.CommandContext(ctx2, c.args[0], c.args[1:]...).CombinedOutput()
 
 					result := make(map[string]interface{})
-					result["target"] = target
-					result["command"] = fmt.Sprintf("ping -c 1 -W 1 %s", target)
+					result["command"] = strings.Join(c.args, " ")
 					if err != nil {
 						result["error"] = err.Error()
 					}
 					result["output"] = string(out)
-					debug[fmt.Sprintf("ping_%s", strings.ReplaceAll(target, ".", "_"))] = result
+
+					// Truncate very long outputs
+					if len(out) > 10000 {
+						result["output"] = string(out[:10000]) + "\n... [truncated]"
+						result["truncated"] = true
+					}
+
+					debug[c.name] = result
 				}()
 			}
+
+			// Test connectivity
+			pingTargets := []struct {
+				name   string
+				target string
+			}{
+				{"loopback", "127.0.0.1"},
+				{"gateway", s.getGatewayForDebug()},
+				{"dns_local", "10.1.1.1"},
+				{"internet_primary", s.cfg.InternetHost},
+				{"internet_fallback", "8.8.8.8"},
+			}
+
+			for _, pt := range pingTargets {
+				if pt.target == "" {
+					continue
+				}
+
+				func() {
+					ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+
+					// Try ICMP first
+					out, err := exec.CommandContext(ctx2, "ping", "-c", "1", "-W", "1", pt.target).CombinedOutput()
+
+					result := make(map[string]interface{})
+					result["target"] = pt.target
+					result["name"] = pt.name
+					result["command"] = fmt.Sprintf("ping -c 1 -W 1 %s", pt.target)
+					if err != nil {
+						result["error"] = err.Error()
+					}
+					result["output"] = string(out)
+
+					// Also try TCP connect
+					tcpResult := make(map[string]interface{})
+					start := time.Now()
+					conn, tcpErr := net.DialTimeout("tcp", net.JoinHostPort(pt.target, "53"), 1*time.Second)
+					elapsed := time.Since(start).Milliseconds()
+
+					if tcpErr == nil {
+						conn.Close()
+						tcpResult["success"] = true
+						tcpResult["latency_ms"] = elapsed
+					} else {
+						tcpResult["success"] = false
+						tcpResult["error"] = tcpErr.Error()
+					}
+					result["tcp_test"] = tcpResult
+
+					debug[fmt.Sprintf("ping_%s", pt.name)] = result
+				}()
+			}
+
+			// Netlink diagnostics
+			netlinkDebug := make(map[string]interface{})
+
+			// Try to get routes via netlink
+			if routes, err := netlink.RouteList(nil, 4); err == nil {
+				var defaultRoutes []map[string]interface{}
+				for _, route := range routes {
+					if route.Dst == nil || (route.Dst != nil && route.Dst.String() == "0.0.0.0/0") {
+						routeInfo := map[string]interface{}{
+							"gateway":    "",
+							"link_index": route.LinkIndex,
+							"priority":   route.Priority,
+							"table":      route.Table,
+						}
+						if route.Gw != nil {
+							routeInfo["gateway"] = route.Gw.String()
+						}
+						if route.LinkIndex > 0 {
+							if link, err := netlink.LinkByIndex(route.LinkIndex); err == nil {
+								routeInfo["interface"] = link.Attrs().Name
+							}
+						}
+						defaultRoutes = append(defaultRoutes, routeInfo)
+					}
+				}
+				netlinkDebug["default_routes"] = defaultRoutes
+			} else {
+				netlinkDebug["error"] = err.Error()
+			}
+
+			debug["netlink"] = netlinkDebug
 
 			return debug, nil
 
@@ -728,9 +933,53 @@ func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]inter
 
 		case "get_config":
 			return structToMap(s.cfg)
+
+		case "test_reading":
+			// Force a fresh reading without cache
+			timeout := time.Duration(s.cfg.MaxReadingsTimeMs) * time.Millisecond
+			ctx2, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			reading := s.collectReading(ctx2)
+			return structToMap(*reading)
 		}
 	}
 	return nil, errUnimplemented
+}
+
+func (s *connectivitySensor) getGatewayForDebug() string {
+	// Quick gateway lookup for debug
+	routes, err := netlink.RouteList(nil, 4)
+	if err == nil {
+		for _, route := range routes {
+			if route.Dst == nil && route.Gw != nil {
+				return route.Gw.String()
+			}
+		}
+	}
+	return ""
+}
+
+func determineRoute(gatewayLoss, internetLoss *float64) string {
+	// No gateway = isolated
+	if gatewayLoss == nil {
+		return "None"
+	}
+
+	gwLoss := *gatewayLoss
+
+	// Gateway unreachable
+	if gwLoss > 50 {
+		return "Limited"
+	}
+
+	// Gateway OK but no internet
+	if internetLoss == nil || *internetLoss > 50 {
+		return "LAN"
+	}
+
+	// Full connectivity
+	return "Internet"
 }
 
 func (s *connectivitySensor) Close(context.Context) error {
