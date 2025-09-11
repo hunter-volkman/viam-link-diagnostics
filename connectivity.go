@@ -265,6 +265,22 @@ func (s *connectivitySensor) getDefaultInterface() string {
 		}
 	}
 
+	// macOS fallback - use route command
+	out, err = exec.CommandContext(ctx, "route", "-n", "get", "default").Output()
+	if err == nil {
+		// Parse macOS route output for interface
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "interface:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					return parts[1]
+				}
+			}
+		}
+	}
+
 	return "unknown"
 }
 
@@ -574,14 +590,142 @@ func structToMap(v interface{}) (map[string]interface{}, error) {
 }
 
 func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	// Optional: implement custom commands like "clear_cache"
 	if cmdName, ok := cmd["command"].(string); ok {
 		switch cmdName {
+		case "debug":
+			// Run all diagnostic commands and return raw outputs
+			debug := make(map[string]interface{})
+
+			// Get config and detected interface
+			debug["config"] = s.cfg
+			iface := s.cfg.Iface
+			if iface == "" || iface == "auto" {
+				iface = s.getDefaultInterface()
+			}
+			debug["detected_interface"] = iface
+
+			// Run diagnostic commands
+			commands := []struct {
+				name string
+				args []string
+			}{
+				{"ip_route_default", []string{"ip", "route", "show", "default"}},
+				{"ip_addr_show", []string{"ip", "addr", "show"}},
+				{"ip_link_show", []string{"ip", "link", "show"}},
+				{"route_get_default", []string{"route", "-n", "get", "default"}},
+				{"ifconfig_all", []string{"ifconfig"}},
+				{"netstat_rn", []string{"netstat", "-rn"}},
+				{"cat_resolv_conf", []string{"cat", "/etc/resolv.conf"}},
+				{"ls_sys_class_net", []string{"ls", "-la", "/sys/class/net/"}},
+			}
+
+			for _, c := range commands {
+				func() {
+					ctx2, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+					defer cancel()
+
+					out, err := exec.CommandContext(ctx2, c.args[0], c.args[1:]...).CombinedOutput()
+
+					result := make(map[string]interface{})
+					result["command"] = strings.Join(c.args, " ")
+					if err != nil {
+						result["error"] = err.Error()
+					}
+					result["output"] = string(out)
+					debug[c.name] = result
+				}()
+			}
+
+			// If we have a specific interface, try interface-specific commands
+			if iface != "" && iface != "unknown" {
+				ifaceCommands := []struct {
+					name string
+					args []string
+				}{
+					{"ifconfig_iface", []string{"ifconfig", iface}},
+					{"ip_addr_show_iface", []string{"ip", "addr", "show", iface}},
+				}
+
+				// Wi-Fi specific commands
+				if strings.HasPrefix(iface, "wlan") || strings.HasPrefix(iface, "wl") {
+					ifaceCommands = append(ifaceCommands,
+						struct {
+							name string
+							args []string
+						}{"iw_dev_link", []string{"iw", "dev", iface, "link"}},
+						struct {
+							name string
+							args []string
+						}{"iw_dev_station", []string{"iw", "dev", iface, "station", "dump"}},
+						struct {
+							name string
+							args []string
+						}{"iw_dev_info", []string{"iw", "dev", iface, "info"}},
+						struct {
+							name string
+							args []string
+						}{"iwconfig", []string{"iwconfig", iface}},
+					)
+				}
+
+				// NetworkManager commands
+				ifaceCommands = append(ifaceCommands,
+					struct {
+						name string
+						args []string
+					}{"nmcli_dev_show", []string{"nmcli", "-t", "dev", "show", iface}},
+					struct {
+						name string
+						args []string
+					}{"nmcli_con_show", []string{"nmcli", "-t", "con", "show"}},
+				)
+
+				for _, c := range ifaceCommands {
+					func() {
+						ctx2, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+						defer cancel()
+
+						out, err := exec.CommandContext(ctx2, c.args[0], c.args[1:]...).CombinedOutput()
+
+						result := make(map[string]interface{})
+						result["command"] = strings.Join(c.args, " ")
+						if err != nil {
+							result["error"] = err.Error()
+						}
+						result["output"] = string(out)
+						debug[c.name] = result
+					}()
+				}
+			}
+
+			// Test ping
+			pingTargets := []string{"127.0.0.1", s.cfg.InternetHost, "8.8.8.8"}
+			for _, target := range pingTargets {
+				func() {
+					ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+
+					out, err := exec.CommandContext(ctx2, "ping", "-c", "1", "-W", "1", target).CombinedOutput()
+
+					result := make(map[string]interface{})
+					result["target"] = target
+					result["command"] = fmt.Sprintf("ping -c 1 -W 1 %s", target)
+					if err != nil {
+						result["error"] = err.Error()
+					}
+					result["output"] = string(out)
+					debug[fmt.Sprintf("ping_%s", strings.ReplaceAll(target, ".", "_"))] = result
+				}()
+			}
+
+			return debug, nil
+
 		case "clear_cache":
 			s.cacheMu.Lock()
 			s.cachedReading = nil
 			s.cacheMu.Unlock()
 			return map[string]interface{}{"status": "cache_cleared"}, nil
+
 		case "get_config":
 			return structToMap(s.cfg)
 		}
