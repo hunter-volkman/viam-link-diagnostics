@@ -27,10 +27,11 @@ func init() {
 }
 
 type Config struct {
-	Iface        string `json:"iface"`
-	RefreshSecs  int    `json:"refresh_secs,omitempty"`
-	InternetHost string `json:"internet_host,omitempty"`
-	PingSamples  int    `json:"ping_samples,omitempty"`
+	Iface          string `json:"iface"`
+	RefreshSecs    int    `json:"refresh_secs,omitempty"`
+	InternetHost   string `json:"internet_host,omitempty"`
+	PingSamples    int    `json:"ping_samples,omitempty"`
+	PingTimeoutSec int    `json:"ping_timeout_sec,omitempty"`
 }
 
 func (cfg *Config) Validate(path string) ([]string, error) {
@@ -43,6 +44,9 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 	}
 	if cfg.PingSamples <= 0 {
 		cfg.PingSamples = 3
+	}
+	if cfg.PingTimeoutSec <= 0 {
+		cfg.PingTimeoutSec = 1
 	}
 	return nil, nil
 }
@@ -202,13 +206,13 @@ func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r
 		}
 	}
 
-	// Get DNS servers
+	// Get DNS servers - convert to interface{} array for protobuf compatibility
 	ctx4, cancel3 := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel3()
 
 	out, err = exec.CommandContext(ctx4, "grep", "^nameserver", "/etc/resolv.conf").Output()
 	if err == nil {
-		var dns []string
+		var dns []interface{}
 		for _, line := range strings.Split(string(out), "\n") {
 			parts := strings.Fields(line)
 			if len(parts) >= 2 && parts[0] == "nameserver" {
