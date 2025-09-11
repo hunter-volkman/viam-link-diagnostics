@@ -270,59 +270,38 @@ func (s *connectivitySensor) detectInterfaceType(iface string) string {
 func (s *connectivitySensor) collectNetworkInfo(ctx context.Context, reading *Reading) {
 	iface := reading.Iface
 
-	// Get interface details via netlink
+	// Get interface details via netlink for addresses
 	link, err := netlink.LinkByName(iface)
-	if err != nil {
-		s.logger.Debugw("failed to get link, using fallback", "iface", iface, "error", err)
-		s.collectNetworkInfoFallback(ctx, reading)
-		return
-	}
-
-	linkIndex := link.Attrs().Index
-
-	// Get addresses
-	addrs, err := netlink.AddrList(link, 0) // 0 = all families
 	if err == nil {
-		for _, addr := range addrs {
-			if addr.IP.To4() != nil && reading.IPv4 == nil {
-				ipStr := addr.IP.String()
-				reading.IPv4 = &ipStr
-			} else if addr.IP.To16() != nil && addr.IP.To4() == nil && reading.IPv6 == nil {
-				ipStr := addr.IP.String()
-				reading.IPv6 = &ipStr
-			}
-		}
-	}
-
-	// Get ALL routes to find the default gateway
-	routes, err := netlink.RouteList(nil, 4)
-	if err != nil {
-		s.logger.Debugw("failed to get routes via netlink", "error", err)
-		s.collectNetworkInfoFallback(ctx, reading)
-		return
-	}
-
-	// Find default route for our interface
-	for _, route := range routes {
-		// Default route has nil Dst or 0.0.0.0/0
-		if route.Dst == nil || (route.Dst != nil && route.Dst.String() == "0.0.0.0/0") {
-			// Check if this route is for our interface
-			if route.LinkIndex == linkIndex {
-				reading.DefaultRoute = true
-				if route.Gw != nil {
-					gwStr := route.Gw.String()
-					reading.GatewayIP = &gwStr
-					s.logger.Debugw("found default route", "gateway", gwStr, "interface", iface)
+		// Get addresses
+		addrs, err := netlink.AddrList(link, 0)
+		if err == nil {
+			for _, addr := range addrs {
+				if addr.IP.To4() != nil && reading.IPv4 == nil {
+					ipStr := addr.IP.String()
+					reading.IPv4 = &ipStr
+				} else if addr.IP.To16() != nil && addr.IP.To4() == nil && reading.IPv6 == nil {
+					ipStr := addr.IP.String()
+					reading.IPv6 = &ipStr
 				}
-				break
 			}
 		}
 	}
 
-	// If netlink didn't find the route, fallback to shell
-	if reading.GatewayIP == nil {
-		s.logger.Debugw("netlink didn't find gateway, trying shell fallback")
-		s.collectNetworkInfoFallback(ctx, reading)
+	// Always use shell command for gateway - it's more reliable
+	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx2, "ip", "route", "show", "default", "dev", iface)
+	out, err := cmd.Output()
+	if err == nil && len(out) > 0 {
+		output := string(out)
+		// Parse: default via 10.1.1.1 dev wlan0
+		if match := regexp.MustCompile(`default\s+via\s+([0-9.]+)`).FindStringSubmatch(output); len(match) > 1 {
+			gwStr := match[1]
+			reading.GatewayIP = &gwStr
+			reading.DefaultRoute = true
+		}
 	}
 
 	// Get DNS servers from resolv.conf
