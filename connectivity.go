@@ -44,7 +44,7 @@ type Config struct {
 }
 
 // Validate ensures config is valid
-func (cfg *Config) Validate(path string) ([]string, []string, error) {
+func (cfg *Config) Validate(path string) ([]string, error) {
 	// Set defaults
 	if cfg.PingSamples <= 0 {
 		cfg.PingSamples = 3
@@ -61,7 +61,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.MaxReadingsTimeMs <= 0 {
 		cfg.MaxReadingsTimeMs = 1200
 	}
-	return nil, nil, nil
+	return nil, nil
 }
 
 // Reading represents all link health metrics
@@ -116,10 +116,15 @@ func newConnectivitySensor(ctx context.Context, deps resource.Dependencies, rawC
 		return nil, err
 	}
 
+	return NewSensor(ctx, deps, rawConf.ResourceName(), conf, logger)
+}
+
+// NewSensor creates a new connectivity sensor instance
+func NewSensor(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (sensor.Sensor, error) {
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	s := &connectivitySensor{
-		name:       rawConf.ResourceName(),
+		name:       name,
 		logger:     logger,
 		cfg:        conf,
 		cancelCtx:  cancelCtx,
@@ -231,7 +236,7 @@ func (s *connectivitySensor) collectReading(ctx context.Context) *Reading {
 
 func (s *connectivitySensor) getDefaultInterface() string {
 	// Try netlink first
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
+	routes, err := netlink.RouteList(nil, 4)
 	if err == nil {
 		for _, route := range routes {
 			if route.Dst == nil { // default route
@@ -286,7 +291,7 @@ func (s *connectivitySensor) collectNetworkInfo(ctx context.Context, reading *Re
 	}
 
 	// Get addresses
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	addrs, err := netlink.AddrList(link, 0)
 	if err == nil {
 		for _, addr := range addrs {
 			if addr.IP.To4() != nil && reading.IPv4 == nil {
@@ -300,7 +305,7 @@ func (s *connectivitySensor) collectNetworkInfo(ctx context.Context, reading *Re
 	}
 
 	// Get default route and gateway
-	routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
+	routes, err := netlink.RouteList(link, 4)
 	if err == nil {
 		for _, route := range routes {
 			if route.Dst == nil { // default route
