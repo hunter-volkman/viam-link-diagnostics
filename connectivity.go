@@ -291,7 +291,7 @@ func (s *connectivitySensor) collectNetworkInfo(ctx context.Context, reading *Re
 	}
 
 	// Get addresses
-	addrs, err := netlink.AddrList(link, 0)
+	addrs, err := netlink.AddrList(link, 0) // 0 = all families
 	if err == nil {
 		for _, addr := range addrs {
 			if addr.IP.To4() != nil && reading.IPv4 == nil {
@@ -304,16 +304,15 @@ func (s *connectivitySensor) collectNetworkInfo(ctx context.Context, reading *Re
 		}
 	}
 
-	// Get default route and gateway
-	routes, err := netlink.RouteList(link, 4)
+	// Get ALL routes to find the default gateway (not interface-specific)
+	routes, err := netlink.RouteList(nil, 4) // nil = all interfaces, 4 = IPv4
 	if err == nil {
 		for _, route := range routes {
-			if route.Dst == nil { // default route
+			if route.Dst == nil && route.Gw != nil { // default route with gateway
 				reading.DefaultRoute = true
-				if route.Gw != nil {
-					gwStr := route.Gw.String()
-					reading.GatewayIP = &gwStr
-				}
+				gwStr := route.Gw.String()
+				reading.GatewayIP = &gwStr
+				break
 			}
 		}
 	}
@@ -379,20 +378,20 @@ func (s *connectivitySensor) collectWiFiInfo(ctx context.Context, reading *Readi
 
 	linkInfo := string(out)
 
-	// Parse SSID
-	if match := regexp.MustCompile(`SSID: (.+)`).FindStringSubmatch(linkInfo); len(match) > 1 {
-		ssid := match[1]
-		reading.SSID = &ssid
-	}
-
-	// Parse BSSID
+	// Parse BSSID - Connected to XX:XX:XX:XX:XX:XX
 	if match := regexp.MustCompile(`Connected to ([0-9a-fA-F:]+)`).FindStringSubmatch(linkInfo); len(match) > 1 {
 		bssid := match[1]
 		reading.BSSID = &bssid
 	}
 
-	// Parse channel and frequency
-	if match := regexp.MustCompile(`freq: (\d+)`).FindStringSubmatch(linkInfo); len(match) > 1 {
+	// Parse SSID - appears after "SSID:"
+	if match := regexp.MustCompile(`SSID:\s*(.+)`).FindStringSubmatch(linkInfo); len(match) > 1 {
+		ssid := strings.TrimSpace(match[1])
+		reading.SSID = &ssid
+	}
+
+	// Parse frequency
+	if match := regexp.MustCompile(`freq:\s*(\d+)`).FindStringSubmatch(linkInfo); len(match) > 1 {
 		if freq, err := strconv.Atoi(match[1]); err == nil {
 			channel, band := s.freqToChannelBand(freq)
 			reading.Channel = &channel
@@ -400,46 +399,45 @@ func (s *connectivitySensor) collectWiFiInfo(ctx context.Context, reading *Readi
 		}
 	}
 
-	// Get station info
+	// Parse signal strength from link output
+	if match := regexp.MustCompile(`signal:\s*(-?\d+)\s*dBm`).FindStringSubmatch(linkInfo); len(match) > 1 {
+		if rssi, err := strconv.Atoi(match[1]); err == nil {
+			reading.RSSIDbm = &rssi
+			quality := s.rssiToQuality(rssi)
+			reading.LinkQualityPct = &quality
+		}
+	}
+
+	// Parse tx bitrate from link output
+	if match := regexp.MustCompile(`tx bitrate:\s*([\d.]+)\s*MBit/s`).FindStringSubmatch(linkInfo); len(match) > 1 {
+		if rate, err := strconv.ParseFloat(match[1], 64); err == nil {
+			reading.TxBitrateMbps = &rate
+		}
+	}
+
+	// Parse rx bitrate from link output
+	if match := regexp.MustCompile(`rx bitrate:\s*([\d.]+)\s*MBit/s`).FindStringSubmatch(linkInfo); len(match) > 1 {
+		if rate, err := strconv.ParseFloat(match[1], 64); err == nil {
+			reading.RxBitrateMbps = &rate
+		}
+	}
+
+	// Get station info for additional details
 	if reading.BSSID != nil {
 		cmd = exec.CommandContext(ctx, "iw", "dev", iface, "station", "dump")
 		out, err = cmd.Output()
 		if err == nil {
 			stationInfo := string(out)
 
-			// Parse signal
-			if match := regexp.MustCompile(`signal:\s+(-?\d+) dBm`).FindStringSubmatch(stationInfo); len(match) > 1 {
-				if rssi, err := strconv.Atoi(match[1]); err == nil {
-					reading.RSSIDbm = &rssi
-					// Calculate link quality (simple approximation)
-					quality := s.rssiToQuality(rssi)
-					reading.LinkQualityPct = &quality
-				}
-			}
-
-			// Parse tx bitrate
-			if match := regexp.MustCompile(`tx bitrate:\s+([\d.]+) MBit/s`).FindStringSubmatch(stationInfo); len(match) > 1 {
-				if rate, err := strconv.ParseFloat(match[1], 64); err == nil {
-					reading.TxBitrateMbps = &rate
-				}
-			}
-
-			// Parse rx bitrate
-			if match := regexp.MustCompile(`rx bitrate:\s+([\d.]+) MBit/s`).FindStringSubmatch(stationInfo); len(match) > 1 {
-				if rate, err := strconv.ParseFloat(match[1], 64); err == nil {
-					reading.RxBitrateMbps = &rate
-				}
-			}
-
-			// Parse tx retries
-			if match := regexp.MustCompile(`tx retries:\s+(\d+)`).FindStringSubmatch(stationInfo); len(match) > 1 {
+			// Parse tx failed as retries
+			if match := regexp.MustCompile(`tx failed:\s*(\d+)`).FindStringSubmatch(stationInfo); len(match) > 1 {
 				if retries, err := strconv.Atoi(match[1]); err == nil {
 					reading.TxRetries = &retries
 				}
 			}
 
 			// Parse connected time
-			if match := regexp.MustCompile(`connected time:\s+(\d+) seconds`).FindStringSubmatch(stationInfo); len(match) > 1 {
+			if match := regexp.MustCompile(`connected time:\s*(\d+)\s*seconds`).FindStringSubmatch(stationInfo); len(match) > 1 {
 				if secs, err := strconv.Atoi(match[1]); err == nil {
 					assocTime := time.Now().Add(-time.Duration(secs) * time.Second).UTC().Format(time.RFC3339)
 					reading.LastAssocTs = &assocTime
