@@ -159,29 +159,6 @@ func (s *connectivitySensor) probeInternet(ctx context.Context) (*float64, *floa
 	return nil, &loss
 }
 
-// determineRoute classifies the network path based on probes
-func determineRoute(gatewayLoss, internetLoss *float64) string {
-	// No gateway = isolated
-	if gatewayLoss == nil {
-		return "None"
-	}
-
-	gwLoss := *gatewayLoss
-
-	// Gateway unreachable
-	if gwLoss > 50 {
-		return "Limited"
-	}
-
-	// Gateway OK but no internet
-	if internetLoss == nil || *internetLoss > 50 {
-		return "LAN"
-	}
-
-	// Full connectivity
-	return "Internet"
-}
-
 // checkICMPAvailable tests if ICMP ping is available (non-root)
 func checkICMPAvailable() bool {
 	cmd := exec.Command("ping", "-c", "1", "-W", "1", "127.0.0.1")
