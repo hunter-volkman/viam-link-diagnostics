@@ -16,7 +16,7 @@ import (
 	"go.viam.com/rdk/resource"
 )
 
-var Model = resource.NewModel("hunter", "connectivity", "sensor")
+var Model = resource.NewModel("hunter", "link-diagnostics", "sensor")
 
 func init() {
 	resource.RegisterComponent(sensor.API, Model,
@@ -32,6 +32,8 @@ type Config struct {
 	InternetHost   string `json:"internet_host,omitempty"`
 	PingSamples    int    `json:"ping_samples,omitempty"`
 	PingTimeoutSec int    `json:"ping_timeout_sec,omitempty"`
+	TestDNS        bool   `json:"test_dns,omitempty"`       // New: Enable DNS resolution test
+	TestTCPPorts   bool   `json:"test_tcp_ports,omitempty"` // New: Test specific TCP ports
 }
 
 func (cfg *Config) Validate(path string) ([]string, error) {
@@ -47,6 +49,13 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 	}
 	if cfg.PingTimeoutSec <= 0 {
 		cfg.PingTimeoutSec = 1
+	}
+	// DNS and TCP tests default to true for comprehensive diagnostics
+	if !cfg.TestDNS {
+		cfg.TestDNS = true
+	}
+	if !cfg.TestTCPPorts {
+		cfg.TestTCPPorts = true
 	}
 	return nil, nil
 }
@@ -124,13 +133,23 @@ func (s *connectivitySensor) collectSimple(ctx context.Context) map[string]inter
 	// Get basic network info using simple commands
 	s.getNetworkInfo(ctx, iface, r)
 
+	// Get extended network info (NEW)
+	s.getExtendedNetworkInfo(ctx, iface, r)
+
 	// Get Wi-Fi info if applicable
 	if r["iface_type"] == "wifi" {
 		s.getWiFiInfo(ctx, iface, r)
+		// Get extended Wi-Fi info (NEW)
+		s.getExtendedWiFiInfo(ctx, iface, r)
 	}
 
 	// Do connectivity tests
 	s.testConnectivity(ctx, r)
+
+	// Do extended connectivity tests (NEW)
+	if s.cfg.TestDNS || s.cfg.TestTCPPorts {
+		s.testExtendedConnectivity(ctx, r)
+	}
 
 	return r
 }
@@ -159,22 +178,33 @@ func (s *connectivitySensor) getInterface() string {
 }
 
 func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r map[string]interface{}) {
-	// Get IP address
+	// Get IP address and MAC address (UPDATED)
 	ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
 	out, err := exec.CommandContext(ctx2, "ip", "addr", "show", iface).Output()
 	if err == nil {
-		// Parse IPv4
-		if match := regexp.MustCompile(`inet\s+(\S+)`).FindStringSubmatch(string(out)); len(match) > 1 {
-			// Remove /XX subnet mask
-			if ip := strings.Split(match[1], "/")[0]; ip != "" {
-				r["ipv4"] = ip
+		output := string(out)
+
+		// Parse MAC address (NEW)
+		if match := regexp.MustCompile(`link/ether\s+([0-9a-fA-F:]+)`).FindStringSubmatch(output); len(match) > 1 {
+			r["mac_address"] = strings.ToLower(match[1])
+		}
+
+		// Parse IPv4 with subnet mask (UPDATED)
+		if match := regexp.MustCompile(`inet\s+(\S+)`).FindStringSubmatch(output); len(match) > 1 {
+			fullIP := match[1]
+			parts := strings.Split(fullIP, "/")
+			if len(parts) > 0 {
+				r["ipv4"] = parts[0]
+				if len(parts) > 1 {
+					r["subnet_bits"] = parts[1] // NEW: subnet mask in CIDR notation
+				}
 			}
 		}
 
 		// Parse IPv6 (exclude link-local fe80::)
-		lines := strings.Split(string(out), "\n")
+		lines := strings.Split(output, "\n")
 		for _, line := range lines {
 			if strings.Contains(line, "inet6") && !strings.Contains(line, "fe80::") {
 				if match := regexp.MustCompile(`inet6\s+(\S+)`).FindStringSubmatch(line); len(match) > 1 {
@@ -184,6 +214,18 @@ func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r
 					}
 				}
 			}
+		}
+
+		// Parse MTU (NEW)
+		if match := regexp.MustCompile(`mtu\s+(\d+)`).FindStringSubmatch(output); len(match) > 1 {
+			if mtu, err := strconv.Atoi(match[1]); err == nil {
+				r["mtu"] = mtu
+			}
+		}
+
+		// Parse link state for uptime calculation (NEW)
+		if match := regexp.MustCompile(`state\s+(\S+)`).FindStringSubmatch(output); len(match) > 1 {
+			r["link_state"] = match[1]
 		}
 	}
 
@@ -206,13 +248,13 @@ func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r
 		}
 	}
 
-	// Get DNS servers - convert to interface{} array for protobuf compatibility
+	// Get DNS servers - convert to comma-separated string for protobuf compatibility
 	ctx4, cancel3 := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel3()
 
 	out, err = exec.CommandContext(ctx4, "grep", "^nameserver", "/etc/resolv.conf").Output()
 	if err == nil {
-		var dns []interface{}
+		var dns []string
 		for _, line := range strings.Split(string(out), "\n") {
 			parts := strings.Fields(line)
 			if len(parts) >= 2 && parts[0] == "nameserver" {
@@ -220,7 +262,7 @@ func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r
 			}
 		}
 		if len(dns) > 0 {
-			r["dns_servers"] = dns
+			r["dns_servers"] = strings.Join(dns, ",")
 		}
 	}
 
@@ -234,6 +276,65 @@ func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r
 		if match := regexp.MustCompile(`STATE:.*\((.*?)\)`).FindStringSubmatch(string(out)); len(match) > 1 {
 			r["nm_state"] = match[1]
 		}
+	}
+}
+
+// NEW: Get extended network information
+func (s *connectivitySensor) getExtendedNetworkInfo(ctx context.Context, iface string, r map[string]interface{}) {
+	// Get interface statistics for packet counts and errors
+	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	statsFile := fmt.Sprintf("/sys/class/net/%s/statistics/", iface)
+
+	// Read TX packets
+	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"tx_packets").Output(); err == nil {
+		if txPackets, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+			r["tx_packets"] = txPackets
+		}
+	}
+
+	// Read RX packets
+	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"rx_packets").Output(); err == nil {
+		if rxPackets, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+			r["rx_packets"] = rxPackets
+		}
+	}
+
+	// Read TX errors
+	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"tx_errors").Output(); err == nil {
+		if txErrors, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+			r["tx_errors"] = txErrors
+		}
+	}
+
+	// Read RX errors
+	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"rx_errors").Output(); err == nil {
+		if rxErrors, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+			r["rx_errors"] = rxErrors
+		}
+	}
+
+	// Get interface uptime (time since last state change)
+	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"../carrier_changes").Output(); err == nil {
+		if changes, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+			r["carrier_changes"] = changes
+		}
+	}
+
+	// Count total routes (to detect routing conflicts)
+	ctx3, cancel2 := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel2()
+
+	if out, err := exec.CommandContext(ctx3, "ip", "route", "show").Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		nonEmptyLines := 0
+		for _, line := range lines {
+			if strings.TrimSpace(line) != "" {
+				nonEmptyLines++
+			}
+		}
+		r["route_count"] = nonEmptyLines
 	}
 }
 
@@ -306,10 +407,17 @@ func (s *connectivitySensor) getWiFiInfo(ctx context.Context, iface string, r ma
 	if err == nil {
 		output := string(out)
 
-		// TX retries
+		// TX retries (failed count)
 		if match := regexp.MustCompile(`tx failed:\s*(\d+)`).FindStringSubmatch(output); len(match) > 1 {
 			if retries, err := strconv.Atoi(match[1]); err == nil {
 				r["tx_retries"] = retries
+			}
+		}
+
+		// RX dropped packets (NEW)
+		if match := regexp.MustCompile(`rx dropped misc:\s*(\d+)`).FindStringSubmatch(output); len(match) > 1 {
+			if dropped, err := strconv.Atoi(match[1]); err == nil {
+				r["rx_dropped"] = dropped
 			}
 		}
 
@@ -319,6 +427,45 @@ func (s *connectivitySensor) getWiFiInfo(ctx context.Context, iface string, r ma
 				assocTime := time.Now().Add(-time.Duration(secs) * time.Second).UTC().Format(time.RFC3339)
 				r["last_assoc_ts"] = assocTime
 			}
+		}
+	}
+}
+
+// NEW: Get extended Wi-Fi information including noise floor and SNR
+func (s *connectivitySensor) getExtendedWiFiInfo(ctx context.Context, iface string, r map[string]interface{}) {
+	// Try to get noise floor and calculate SNR
+	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	// Get wireless info including noise
+	if out, err := exec.CommandContext(ctx2, "iw", "dev", iface, "survey", "dump").Output(); err == nil {
+		output := string(out)
+		// Look for noise floor in the current channel
+		if match := regexp.MustCompile(`noise:\s*(-?\d+)\s*dBm`).FindStringSubmatch(output); len(match) > 1 {
+			if noise, err := strconv.Atoi(match[1]); err == nil {
+				r["noise_floor_dbm"] = noise
+
+				// Calculate SNR if we have RSSI
+				if rssi, ok := r["rssi_dbm"].(int); ok {
+					r["snr_db"] = rssi - noise
+				}
+			}
+		}
+	}
+
+	// Get channel width
+	if out, err := exec.CommandContext(ctx2, "iw", "dev", iface, "info").Output(); err == nil {
+		output := string(out)
+		// Parse channel width
+		if match := regexp.MustCompile(`width:\s*(\d+)\s*MHz`).FindStringSubmatch(output); len(match) > 1 {
+			if width, err := strconv.Atoi(match[1]); err == nil {
+				r["channel_width_mhz"] = width
+			}
+		}
+
+		// Parse WiFi type/mode (802.11n/ac/ax)
+		if match := regexp.MustCompile(`type\s+(\S+)`).FindStringSubmatch(output); len(match) > 1 {
+			r["wifi_mode"] = match[1]
 		}
 	}
 }
@@ -346,6 +493,62 @@ func (s *connectivitySensor) testConnectivity(ctx context.Context, r map[string]
 
 	// Determine route
 	r["route"] = s.determineRoute(r)
+}
+
+// NEW: Test extended connectivity including DNS and TCP ports
+func (s *connectivitySensor) testExtendedConnectivity(ctx context.Context, r map[string]interface{}) {
+	// Test DNS resolution
+	if s.cfg.TestDNS {
+		ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+
+		start := time.Now()
+		cmd := exec.CommandContext(ctx2, "nslookup", "google.com")
+		_, err := cmd.Output()
+		elapsed := time.Since(start).Milliseconds()
+
+		if err == nil {
+			r["dns_working"] = true
+			r["dns_latency_ms"] = elapsed
+		} else {
+			r["dns_working"] = false
+		}
+	}
+
+	// Test important TCP ports
+	if s.cfg.TestTCPPorts {
+		// Test HTTPS (443) - Viam uses this
+		if reachable, latency := s.testTCPPort(ctx, s.cfg.InternetHost, "443"); reachable {
+			r["tcp_443_reachable"] = true
+			r["tcp_443_latency_ms"] = latency
+		} else {
+			r["tcp_443_reachable"] = false
+		}
+
+		// Test HTTP (80)
+		if reachable, latency := s.testTCPPort(ctx, s.cfg.InternetHost, "80"); reachable {
+			r["tcp_80_reachable"] = true
+			r["tcp_80_latency_ms"] = latency
+		} else {
+			r["tcp_80_reachable"] = false
+		}
+	}
+}
+
+// NEW: Helper to test a specific TCP port
+func (s *connectivitySensor) testTCPPort(ctx context.Context, host, port string) (bool, float64) {
+	ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := (&net.Dialer{}).DialContext(ctx2, "tcp", net.JoinHostPort(host, port))
+	elapsed := time.Since(start).Seconds() * 1000
+
+	if err == nil {
+		conn.Close()
+		return true, elapsed
+	}
+	return false, 0
 }
 
 func (s *connectivitySensor) ping(ctx context.Context, target string) (*float64, *float64) {
