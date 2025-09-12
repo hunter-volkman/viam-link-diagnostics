@@ -1,4 +1,4 @@
-module connectivity
+module link-diagnostics
 
 go 1.23
 

@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"connectivity"
+
+	sensor "go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
-	sensor "go.viam.com/rdk/components/sensor"
 )
 
 func main() {
@@ -22,9 +22,9 @@ func realMain() error {
 	deps := resource.Dependencies{}
 	// can load these from a remote machine if you need
 
-	cfg := connectivity.Config{}
+	cfg := link - diagnostics.Config{}
 
-	thing, err := connectivity.NewSensor(ctx, deps, sensor.Named("foo"), &cfg, logger)
+	thing, err := link - diagnostics.NewSensor(ctx, deps, sensor.Named("foo"), &cfg, logger)
 	if err != nil {
 		return err
 	}

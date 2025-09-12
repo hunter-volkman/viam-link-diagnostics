@@ -1,15 +1,15 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "hunter:connectivity",
+  "module_id": "hunter:link-diagnostics",
   "visibility": "private",
-  "url": "https://github.com/hunter-volkman/viam-connectivity",
+  "url": "https://github.com/hunter-volkman/viam-link-diagnostics",
   "description": "Sensor component for Wi-Fi or Ethernet link",
   "models": [
     {
       "api": "rdk:component:sensor",
-      "model": "hunter:connectivity:sensor",
-      "short_description": "Provide a short (100 characters or less) description of this model here",
-      "markdown_link": "README.md#model-hunterconnectivitysensor"
+      "model": "hunter:link-diagnostics:sensor",
+      "short_description": "Monitor network link health and diagnostics for Wi-Fi and Ethernet connections",
+      "markdown_link": "README.md#model-hunterlinkdiagnosticssensor"
     }
   ],
   "applications": null,
