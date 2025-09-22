@@ -616,7 +616,14 @@ func (s *connectivitySensor) ping(ctx context.Context, target string) (*float64,
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx2, "ping", "-c", strconv.Itoa(s.cfg.PingSamples), "-W", "1", target)
-	out, _ := cmd.Output()
+	out, err := cmd.Output()
+
+	// Debug logging
+	s.logger.Debugw("ping result",
+		"target", target,
+		"error", err,
+		"output_len", len(out),
+		"output", string(out[:min(200, len(out))])) // First 200 characters
 
 	if len(out) == 0 {
 		// Try TCP fallback
