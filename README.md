@@ -1,6 +1,6 @@
 # Link Diagnostics Module 
 
-A Viam `sensor` component for link diagnostics and connectivity monitoring.
+A Viam `sensor` component for link diagnostics and general connectivity monitoring.
 
 ## Model hunter:link-diagnostics:sensor
 
