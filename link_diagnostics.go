@@ -27,18 +27,26 @@ func init() {
 	)
 }
 
+// Config defines the sensor configuration
 type Config struct {
 	Iface          string `json:"iface"`
 	RefreshSecs    int    `json:"refresh_secs,omitempty"`
 	InternetHost   string `json:"internet_host,omitempty"`
 	PingSamples    int    `json:"ping_samples,omitempty"`
 	PingTimeoutSec int    `json:"ping_timeout_sec,omitempty"`
-	TestDNS        bool   `json:"test_dns,omitempty"`       // Enable DNS resolution test
-	TestTCPPorts   bool   `json:"test_tcp_ports,omitempty"` // Test specific TCP ports
+	TestDNS        bool   `json:"test_dns,omitempty"`
+	TestTCPPorts   bool   `json:"test_tcp_ports,omitempty"`
 }
 
+// Validate ensures config has sensible defaults
 func (cfg *Config) Validate(path string) ([]string, error) {
-	// Set reasonable defaults
+	// Apply defaults
+	cfg.applyDefaults()
+	return nil, nil
+}
+
+// applyDefaults sets reasonable defaults for any missing config values
+func (cfg *Config) applyDefaults() {
 	if cfg.RefreshSecs <= 0 {
 		cfg.RefreshSecs = 5
 	}
@@ -51,14 +59,13 @@ func (cfg *Config) Validate(path string) ([]string, error) {
 	if cfg.PingTimeoutSec <= 0 {
 		cfg.PingTimeoutSec = 1
 	}
-	// DNS and TCP tests default to true for comprehensive diagnostics
+	// Default to enabling extended tests
 	if !cfg.TestDNS {
 		cfg.TestDNS = true
 	}
 	if !cfg.TestTCPPorts {
 		cfg.TestTCPPorts = true
 	}
-	return nil, nil
 }
 
 type connectivitySensor struct {
@@ -72,11 +79,21 @@ type connectivitySensor struct {
 	lastReadTime time.Time
 }
 
+// NewSensor creates a new link diagnostics sensor
 func NewSensor(ctx context.Context, deps resource.Dependencies, conf resource.Config, logger logging.Logger) (sensor.Sensor, error) {
 	cfg, err := resource.NativeConfig[*Config](conf)
 	if err != nil {
 		return nil, err
 	}
+
+	// ALWAYS apply defaults, don't trust Validate() was called
+	cfg.applyDefaults()
+
+	logger.Infow("Link diagnostics sensor configured",
+		"iface", cfg.Iface,
+		"internet_host", cfg.InternetHost,
+		"ping_samples", cfg.PingSamples,
+		"refresh_secs", cfg.RefreshSecs)
 
 	return &connectivitySensor{
 		name:   conf.ResourceName(),
@@ -89,8 +106,9 @@ func (s *connectivitySensor) Name() resource.Name {
 	return s.name
 }
 
+// Readings returns the current network diagnostics
 func (s *connectivitySensor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
-	// Check cache
+	// Check cache first
 	s.mu.RLock()
 	if s.lastReading != nil && time.Since(s.lastReadTime) < time.Duration(s.cfg.RefreshSecs)*time.Second {
 		reading := make(map[string]interface{})
@@ -104,7 +122,7 @@ func (s *connectivitySensor) Readings(ctx context.Context, extra map[string]inte
 	s.mu.RUnlock()
 
 	// Collect fresh reading
-	reading := s.collectSimple(ctx)
+	reading := s.collectDiagnostics(ctx)
 
 	// Update cache
 	s.mu.Lock()
@@ -116,108 +134,39 @@ func (s *connectivitySensor) Readings(ctx context.Context, extra map[string]inte
 	return reading, nil
 }
 
-func (s *connectivitySensor) collectSimple(ctx context.Context) map[string]interface{} {
+// collectDiagnostics gathers all network diagnostic information
+func (s *connectivitySensor) collectDiagnostics(ctx context.Context) map[string]interface{} {
 	r := map[string]interface{}{
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"iface":     s.getInterface(),
 	}
 
-	iface := r["iface"].(string)
+	// 1. Determine network interface
+	iface := s.getActiveInterface()
+	r["iface"] = iface
+	r["iface_type"] = s.getInterfaceType(iface)
 
-	// Detect interface type
-	if strings.HasPrefix(iface, "wlan") || strings.HasPrefix(iface, "wl") {
-		r["iface_type"] = "wifi"
-	} else {
-		r["iface_type"] = "ethernet"
-	}
+	// 2. Collect basic network configuration
+	s.collectNetworkConfig(ctx, iface, r)
 
-	// Get basic network info using simple commands
-	s.getNetworkInfo(ctx, iface, r)
-
-	// Get extended network info
-	s.getExtendedNetworkInfo(ctx, iface, r)
-
-	// Get Wi-Fi info if applicable
+	// 3. Collect WiFi-specific info if applicable
 	if r["iface_type"] == "wifi" {
-		s.getWiFiInfo(ctx, iface, r)
-		// Get extended Wi-Fi info
-		s.getExtendedWiFiInfo(ctx, iface, r)
+		s.collectWiFiInfo(ctx, iface, r)
 	}
 
-	// Do connectivity tests
+	// 4. Test connectivity
 	s.testConnectivity(ctx, r)
-
-	// Do extended connectivity tests
-	if s.cfg.TestDNS || s.cfg.TestTCPPorts {
-		s.testExtendedConnectivity(ctx, r)
-	}
 
 	return r
 }
 
-func (s *connectivitySensor) runSpeedTest(ctx context.Context) (map[string]interface{}, error) {
-	// Check if speedtest-cli is installed on current machine
-	if _, err := exec.LookPath("speedtest-cli"); err != nil {
-		return map[string]interface{}{
-			"error": "speedtest-cli not installed",
-		}, nil
-	}
-
-	// Run speedtest with JSON output
-	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx2, "speedtest-cli", "--json")
-	out, err := cmd.Output()
-	if err != nil {
-		return map[string]interface{}{
-			"error": fmt.Sprintf("speedtest failed: %v", err),
-		}, nil
-	}
-
-	// Parse JSON output
-	var result map[string]interface{}
-	if err := json.Unmarshal(out, &result); err != nil {
-		return map[string]interface{}{
-			"error": fmt.Sprintf("failed to parse speedtest output: %v", err),
-		}, nil
-	}
-
-	// Extract key metrics
-	speedResult := map[string]interface{}{
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	}
-
-	if download, ok := result["download"].(float64); ok {
-		speedResult["download_mbps"] = download / 1_000_000 // Convert from bits to Mbps
-	}
-
-	if upload, ok := result["upload"].(float64); ok {
-		speedResult["upload_mbps"] = upload / 1_000_000
-	}
-
-	if ping, ok := result["ping"].(float64); ok {
-		speedResult["ping_ms"] = ping
-	}
-
-	if server, ok := result["server"].(map[string]interface{}); ok {
-		if sponsor, ok := server["sponsor"].(string); ok {
-			speedResult["server"] = sponsor
-		}
-		if location, ok := server["name"].(string); ok {
-			speedResult["location"] = location
-		}
-	}
-
-	return speedResult, nil
-}
-
-func (s *connectivitySensor) getInterface() string {
+// getActiveInterface returns the active network interface name
+func (s *connectivitySensor) getActiveInterface() string {
+	// Use configured interface if specified
 	if s.cfg.Iface != "" && s.cfg.Iface != "auto" {
 		return s.cfg.Iface
 	}
 
-	// Simple: parse ip route for default interface
+	// Auto-detect default interface
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
@@ -226,7 +175,7 @@ func (s *connectivitySensor) getInterface() string {
 		return "unknown"
 	}
 
-	// Parse: default via X.X.X.X dev wlan0
+	// Extract interface from: default via X.X.X.X dev wlan0
 	re := regexp.MustCompile(`dev\s+(\S+)`)
 	if match := re.FindStringSubmatch(string(out)); len(match) > 1 {
 		return match[1]
@@ -235,67 +184,49 @@ func (s *connectivitySensor) getInterface() string {
 	return "unknown"
 }
 
-func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r map[string]interface{}) {
-	// Get IP address and MAC address
-	ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
+// getInterfaceType determines if interface is wifi or ethernet
+func (s *connectivitySensor) getInterfaceType(iface string) string {
+	if strings.HasPrefix(iface, "wlan") || strings.HasPrefix(iface, "wl") {
+		return "wifi"
+	}
+	return "ethernet"
+}
 
-	out, err := exec.CommandContext(ctx2, "ip", "addr", "show", iface).Output()
-	if err == nil {
+// collectNetworkConfig gathers IP, gateway, DNS, and other network settings
+func (s *connectivitySensor) collectNetworkConfig(ctx context.Context, iface string, r map[string]interface{}) {
+	// Get interface details (IP, MAC, MTU, state)
+	if out := s.execCommand(ctx, 1*time.Second, "ip", "addr", "show", iface); out != nil {
 		output := string(out)
 
-		// Parse MAC address
+		// MAC address
 		if match := regexp.MustCompile(`link/ether\s+([0-9a-fA-F:]+)`).FindStringSubmatch(output); len(match) > 1 {
 			r["mac_address"] = strings.ToLower(match[1])
 		}
 
-		// Parse IPv4 with subnet mask
+		// IPv4 address with subnet
 		if match := regexp.MustCompile(`inet\s+(\S+)`).FindStringSubmatch(output); len(match) > 1 {
-			fullIP := match[1]
-			parts := strings.Split(fullIP, "/")
-			if len(parts) > 0 {
-				r["ipv4"] = parts[0]
-				if len(parts) > 1 {
-					// Subnet mask in CIDR notation
-					r["subnet_bits"] = parts[1]
-				}
+			parts := strings.Split(match[1], "/")
+			r["ipv4"] = parts[0]
+			if len(parts) > 1 {
+				r["subnet_bits"] = parts[1]
 			}
 		}
 
-		// Parse IPv6
-		// Exclude link-local fe80::
-		lines := strings.Split(output, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "inet6") && !strings.Contains(line, "fe80::") {
-				if match := regexp.MustCompile(`inet6\s+(\S+)`).FindStringSubmatch(line); len(match) > 1 {
-					if ip := strings.Split(match[1], "/")[0]; ip != "" {
-						r["ipv6"] = ip
-						break
-					}
-				}
-			}
-		}
-
-		// Parse MTU
+		// MTU
 		if match := regexp.MustCompile(`mtu\s+(\d+)`).FindStringSubmatch(output); len(match) > 1 {
 			if mtu, err := strconv.Atoi(match[1]); err == nil {
 				r["mtu"] = mtu
 			}
 		}
 
-		// Parse link state for uptime calculation
+		// Link state
 		if match := regexp.MustCompile(`state\s+(\S+)`).FindStringSubmatch(output); len(match) > 1 {
 			r["link_state"] = match[1]
 		}
 	}
 
-	// Get gateway (try specific interface first)
-	ctx3, cancel2 := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel2()
-
-	out, err = exec.CommandContext(ctx3, "ip", "route", "list", "default").Output()
-	if err == nil && len(out) > 0 {
-		// Look for gateway on our interface
+	// Get default gateway
+	if out := s.execCommand(ctx, 1*time.Second, "ip", "route", "list", "default"); out != nil {
 		lines := strings.Split(string(out), "\n")
 		for _, line := range lines {
 			if strings.Contains(line, "dev "+iface) {
@@ -308,12 +239,8 @@ func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r
 		}
 	}
 
-	// Get DNS servers - convert to comma-separated string for protobuf compatibility
-	ctx4, cancel3 := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel3()
-
-	out, err = exec.CommandContext(ctx4, "grep", "^nameserver", "/etc/resolv.conf").Output()
-	if err == nil {
+	// Get DNS servers
+	if out := s.execCommand(ctx, 500*time.Millisecond, "grep", "^nameserver", "/etc/resolv.conf"); out != nil {
 		var dns []string
 		for _, line := range strings.Split(string(out), "\n") {
 			parts := strings.Fields(line)
@@ -326,123 +253,104 @@ func (s *connectivitySensor) getNetworkInfo(ctx context.Context, iface string, r
 		}
 	}
 
-	// NetworkManager state (optional)
-	ctx5, cancel4 := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel4()
-
-	out, err = exec.CommandContext(ctx5, "nmcli", "-t", "-f", "GENERAL.STATE", "dev", "show", iface).Output()
-	if err == nil {
-		// Parse GENERAL.STATE:100 (connected)
-		if match := regexp.MustCompile(`STATE:.*\((.*?)\)`).FindStringSubmatch(string(out)); len(match) > 1 {
-			r["nm_state"] = match[1]
-		}
-	}
+	// Get packet statistics
+	s.collectInterfaceStats(ctx, iface, r)
 }
 
-// Get extended network information
-func (s *connectivitySensor) getExtendedNetworkInfo(ctx context.Context, iface string, r map[string]interface{}) {
-	// Get interface statistics for packet counts and errors
-	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel()
+// collectInterfaceStats reads packet and error counts from /sys
+func (s *connectivitySensor) collectInterfaceStats(ctx context.Context, iface string, r map[string]interface{}) {
+	statsPath := fmt.Sprintf("/sys/class/net/%s/statistics/", iface)
 
-	statsFile := fmt.Sprintf("/sys/class/net/%s/statistics/", iface)
-
-	// Read TX packets
-	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"tx_packets").Output(); err == nil {
-		if txPackets, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
-			r["tx_packets"] = txPackets
-		}
+	// Read various statistics
+	stats := map[string]string{
+		"tx_packets": "tx_packets",
+		"rx_packets": "rx_packets",
+		"tx_errors":  "tx_errors",
+		"rx_errors":  "rx_errors",
+		"tx_dropped": "tx_dropped",
+		"rx_dropped": "rx_dropped",
 	}
 
-	// Read RX packets
-	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"rx_packets").Output(); err == nil {
-		if rxPackets, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
-			r["rx_packets"] = rxPackets
-		}
-	}
-
-	// Read TX errors
-	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"tx_errors").Output(); err == nil {
-		if txErrors, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
-			r["tx_errors"] = txErrors
-		}
-	}
-
-	// Read RX errors
-	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"rx_errors").Output(); err == nil {
-		if rxErrors, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
-			r["rx_errors"] = rxErrors
-		}
-	}
-
-	// Get interface uptime (time since last state change)
-	if out, err := exec.CommandContext(ctx2, "cat", statsFile+"../carrier_changes").Output(); err == nil {
-		if changes, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
-			r["carrier_changes"] = changes
-		}
-	}
-
-	// Count total routes (to detect routing conflicts)
-	ctx3, cancel2 := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel2()
-
-	if out, err := exec.CommandContext(ctx3, "ip", "route", "show").Output(); err == nil {
-		lines := strings.Split(string(out), "\n")
-		nonEmptyLines := 0
-		for _, line := range lines {
-			if strings.TrimSpace(line) != "" {
-				nonEmptyLines++
+	for key, file := range stats {
+		if out := s.execCommand(ctx, 200*time.Millisecond, "cat", statsPath+file); out != nil {
+			if val, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64); err == nil {
+				r[key] = val
 			}
 		}
-		r["route_count"] = nonEmptyLines
+	}
+
+	// Calculate drop rates
+	if rxPackets, ok := r["rx_packets"].(int64); ok {
+		if rxDropped, ok := r["rx_dropped"].(int64); ok && rxPackets > 0 {
+			total := rxPackets + rxDropped
+			dropRate := float64(rxDropped) / float64(total) * 100
+			r["rx_drop_rate_pct"] = dropRate
+		}
+	}
+
+	if txPackets, ok := r["tx_packets"].(int64); ok {
+		if txDropped, ok := r["tx_dropped"].(int64); ok && txPackets > 0 {
+			total := txPackets + txDropped
+			dropRate := float64(txDropped) / float64(total) * 100
+			r["tx_drop_rate_pct"] = dropRate
+		}
+	}
+
+	// Calculate error rates
+	if rxPackets, ok := r["rx_packets"].(int64); ok {
+		if rxErrors, ok := r["rx_errors"].(int64); ok && rxPackets > 0 {
+			errorRate := float64(rxErrors) / float64(rxPackets) * 100
+			r["rx_error_rate_pct"] = errorRate
+		}
+	}
+
+	if txPackets, ok := r["tx_packets"].(int64); ok {
+		if txErrors, ok := r["tx_errors"].(int64); ok && txPackets > 0 {
+			errorRate := float64(txErrors) / float64(txPackets) * 100
+			r["tx_error_rate_pct"] = errorRate
+		}
 	}
 }
 
-func (s *connectivitySensor) getWiFiInfo(ctx context.Context, iface string, r map[string]interface{}) {
-	// Try iw first
-	ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel()
-
-	out, err := exec.CommandContext(ctx2, "iw", "dev", iface, "link").Output()
-	if err == nil && !strings.Contains(string(out), "Not connected") {
+// collectWiFiInfo gathers WiFi-specific information
+func (s *connectivitySensor) collectWiFiInfo(ctx context.Context, iface string, r map[string]interface{}) {
+	// Get WiFi link info
+	if out := s.execCommand(ctx, 1*time.Second, "iw", "dev", iface, "link"); out != nil {
 		output := string(out)
+
+		if strings.Contains(output, "Not connected") {
+			r["wifi_connected"] = false
+			return
+		}
+
+		r["wifi_connected"] = true
 
 		// SSID
 		if match := regexp.MustCompile(`SSID:\s*(.+)`).FindStringSubmatch(output); len(match) > 1 {
 			r["ssid"] = strings.TrimSpace(match[1])
 		}
 
-		// BSSID
+		// BSSID (access point MAC)
 		if match := regexp.MustCompile(`Connected to ([0-9a-fA-F:]+)`).FindStringSubmatch(output); len(match) > 1 {
 			r["bssid"] = match[1]
 		}
 
-		// Signal
+		// Signal strength
 		if match := regexp.MustCompile(`signal:\s*(-?\d+)\s*dBm`).FindStringSubmatch(output); len(match) > 1 {
 			if rssi, err := strconv.Atoi(match[1]); err == nil {
 				r["rssi_dbm"] = rssi
-				// Convert to quality %
-				quality := 100
-				if rssi < -30 {
-					quality = int((float64(rssi+90) / 60.0) * 100)
-					if quality < 0 {
-						quality = 0
-					}
-				}
+				// Calculate quality percentage (rough estimate)
+				quality := s.calculateSignalQuality(rssi)
 				r["link_quality_pct"] = quality
 			}
 		}
 
-		// Frequency/Channel
+		// Frequency and channel
 		if match := regexp.MustCompile(`freq:\s*(\d+)`).FindStringSubmatch(output); len(match) > 1 {
 			if freq, err := strconv.Atoi(match[1]); err == nil {
+				r["freq_mhz"] = freq
 				r["band_ghz"] = float64(freq) / 1000.0
-				// Calculate channel (simplified)
-				if freq >= 2412 && freq <= 2484 {
-					r["channel"] = (freq-2412)/5 + 1
-				} else if freq >= 5180 && freq <= 5825 {
-					r["channel"] = (freq-5180)/5 + 36
-				}
+				r["channel"] = s.frequencyToChannel(freq)
 			}
 		}
 
@@ -458,150 +366,153 @@ func (s *connectivitySensor) getWiFiInfo(ctx context.Context, iface string, r ma
 			}
 		}
 	}
-
-	// Try station dump for more details
-	ctx3, cancel2 := context.WithTimeout(ctx, 1*time.Second)
-	defer cancel2()
-
-	out, err = exec.CommandContext(ctx3, "iw", "dev", iface, "station", "dump").Output()
-	if err == nil {
-		output := string(out)
-
-		// TX retries (failed count)
-		if match := regexp.MustCompile(`tx failed:\s*(\d+)`).FindStringSubmatch(output); len(match) > 1 {
-			if retries, err := strconv.Atoi(match[1]); err == nil {
-				r["tx_retries"] = retries
-			}
-		}
-
-		// RX dropped packets
-		if match := regexp.MustCompile(`rx dropped misc:\s*(\d+)`).FindStringSubmatch(output); len(match) > 1 {
-			if dropped, err := strconv.Atoi(match[1]); err == nil {
-				r["rx_dropped"] = dropped
-			}
-		}
-
-		// Connected time
-		if match := regexp.MustCompile(`connected time:\s*(\d+)\s*seconds`).FindStringSubmatch(output); len(match) > 1 {
-			if secs, err := strconv.Atoi(match[1]); err == nil {
-				assocTime := time.Now().Add(-time.Duration(secs) * time.Second).UTC().Format(time.RFC3339)
-				r["last_assoc_ts"] = assocTime
-			}
-		}
-	}
 }
 
-// Get Wi-Fi information including noise floor and SNR
-func (s *connectivitySensor) getExtendedWiFiInfo(ctx context.Context, iface string, r map[string]interface{}) {
-	// Try to get noise floor and calculate SNR
-	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	defer cancel()
-
-	// Get wireless info including noise
-	if out, err := exec.CommandContext(ctx2, "iw", "dev", iface, "survey", "dump").Output(); err == nil {
-		output := string(out)
-		// Look for noise floor in the current channel
-		if match := regexp.MustCompile(`noise:\s*(-?\d+)\s*dBm`).FindStringSubmatch(output); len(match) > 1 {
-			if noise, err := strconv.Atoi(match[1]); err == nil {
-				r["noise_floor_dbm"] = noise
-
-				// Calculate SNR if we have RSSI
-				if rssi, ok := r["rssi_dbm"].(int); ok {
-					r["snr_db"] = rssi - noise
-				}
-			}
-		}
-	}
-
-	// Get channel width
-	if out, err := exec.CommandContext(ctx2, "iw", "dev", iface, "info").Output(); err == nil {
-		output := string(out)
-		// Parse channel width
-		if match := regexp.MustCompile(`width:\s*(\d+)\s*MHz`).FindStringSubmatch(output); len(match) > 1 {
-			if width, err := strconv.Atoi(match[1]); err == nil {
-				r["channel_width_mhz"] = width
-			}
-		}
-
-		// Parse WiFi type/mode (802.11n/ac/ax)
-		if match := regexp.MustCompile(`type\s+(\S+)`).FindStringSubmatch(output); len(match) > 1 {
-			r["wifi_mode"] = match[1]
-		}
-	}
-}
-
+// testConnectivity performs ping tests to gateway and internet
 func (s *connectivitySensor) testConnectivity(ctx context.Context, r map[string]interface{}) {
-	// Test gateway if we have one
+	// Test gateway connectivity
 	if gw, ok := r["gateway_ip"].(string); ok && gw != "" {
-		latency, loss := s.ping(ctx, gw)
-		if latency != nil {
-			r["latency_gw_ms"] = *latency
+		latency, loss := s.pingHost(ctx, gw)
+		if latency >= 0 {
+			r["latency_gw_ms"] = latency
 		}
-		if loss != nil {
-			r["loss_gw_pct"] = *loss
-		}
+		r["loss_gw_pct"] = loss
 	}
 
-	// Test internet
-	latency, loss := s.ping(ctx, s.cfg.InternetHost)
-	if latency != nil {
-		r["latency_inet_ms"] = *latency
+	// Test internet connectivity
+	latency, loss := s.pingHost(ctx, s.cfg.InternetHost)
+	if latency >= 0 {
+		r["latency_inet_ms"] = latency
 	}
-	if loss != nil {
-		r["loss_inet_pct"] = *loss
-	}
+	r["loss_inet_pct"] = loss
 
-	// Determine route
-	r["route"] = s.determineRoute(r)
-}
+	// Determine overall connectivity status
+	r["route"] = s.determineConnectivityStatus(r)
 
-// Test connectivity including DNS and TCP ports
-func (s *connectivitySensor) testExtendedConnectivity(ctx context.Context, r map[string]interface{}) {
-	// Test DNS resolution
+	// Extended tests if enabled
 	if s.cfg.TestDNS {
-		ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-
-		start := time.Now()
-		cmd := exec.CommandContext(ctx2, "nslookup", "google.com")
-		_, err := cmd.Output()
-		elapsed := time.Since(start).Milliseconds()
-
-		if err == nil {
-			r["dns_working"] = true
-			r["dns_latency_ms"] = elapsed
-		} else {
-			r["dns_working"] = false
-		}
+		s.testDNS(ctx, r)
 	}
-
-	// Test important TCP ports
 	if s.cfg.TestTCPPorts {
-		// Test HTTPS (443)
-		if reachable, latency := s.testTCPPort(ctx, s.cfg.InternetHost, "443"); reachable {
-			r["tcp_443_reachable"] = true
-			r["tcp_443_latency_ms"] = latency
-		} else {
-			r["tcp_443_reachable"] = false
-		}
-
-		// Test HTTP (80)
-		if reachable, latency := s.testTCPPort(ctx, s.cfg.InternetHost, "80"); reachable {
-			r["tcp_80_reachable"] = true
-			r["tcp_80_latency_ms"] = latency
-		} else {
-			r["tcp_80_reachable"] = false
-		}
+		s.testTCPPorts(ctx, r)
 	}
 }
 
-// Helper to test a specific TCP port
-func (s *connectivitySensor) testTCPPort(ctx context.Context, host, port string) (bool, float64) {
-	ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
+// pingHost performs ICMP ping test to a target host
+func (s *connectivitySensor) pingHost(ctx context.Context, target string) (latency float64, loss float64) {
+	if target == "" {
+		return -1, 100
+	}
+
+	// Calculate appropriate timeout for the ping operation
+	timeout := time.Duration(s.cfg.PingSamples*s.cfg.PingTimeoutSec+2) * time.Second
+
+	out := s.execCommand(ctx, timeout,
+		"ping", "-c", strconv.Itoa(s.cfg.PingSamples),
+		"-W", strconv.Itoa(s.cfg.PingTimeoutSec),
+		target)
+
+	if out == nil {
+		// Ping failed, try TCP fallback
+		return s.tcpPing(target)
+	}
+
+	output := string(out)
+
+	// Parse average latency from: min/avg/max/mdev = X.X/Y.Y/Z.Z/A.A ms
+	latency = -1
+	if match := regexp.MustCompile(`min/avg/max/mdev = [\d.]+/([\d.]+)/`).FindStringSubmatch(output); len(match) > 1 {
+		if avg, err := strconv.ParseFloat(match[1], 64); err == nil {
+			latency = avg
+		}
+	}
+
+	// Parse packet loss from: X% packet loss
+	loss = 100
+	if match := regexp.MustCompile(`(\d+)% packet loss`).FindStringSubmatch(output); len(match) > 1 {
+		if pct, err := strconv.ParseFloat(match[1], 64); err == nil {
+			loss = pct
+		}
+	}
+
+	// If we parsed latency but not loss, assume 0% loss
+	if latency >= 0 && loss == 100 {
+		loss = 0
+	}
+
+	return latency, loss
+}
+
+// tcpPing attempts TCP connection as fallback when ICMP is blocked
+func (s *connectivitySensor) tcpPing(target string) (latency float64, loss float64) {
+	ports := []string{"53", "443", "80"} // DNS, HTTPS, HTTP
+
+	var totalLatency float64
+	var successCount int
+
+	for i := 0; i < s.cfg.PingSamples; i++ {
+		for _, port := range ports {
+			start := time.Now()
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(target, port), 1*time.Second)
+			if err == nil {
+				conn.Close()
+				totalLatency += float64(time.Since(start).Milliseconds())
+				successCount++
+				break // Success, no need to try other ports
+			}
+		}
+	}
+
+	if successCount > 0 {
+		avgLatency := totalLatency / float64(successCount)
+		loss := float64(s.cfg.PingSamples-successCount) / float64(s.cfg.PingSamples) * 100
+		return avgLatency, loss
+	}
+
+	return -1, 100
+}
+
+// testDNS performs DNS resolution test
+func (s *connectivitySensor) testDNS(ctx context.Context, r map[string]interface{}) {
+	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	start := time.Now()
-	conn, err := (&net.Dialer{}).DialContext(ctx2, "tcp", net.JoinHostPort(host, port))
+	resolver := &net.Resolver{}
+	addrs, err := resolver.LookupHost(ctx2, "google.com")
+	elapsed := time.Since(start).Milliseconds()
+
+	if err == nil && len(addrs) > 0 {
+		r["dns_working"] = true
+		r["dns_latency_ms"] = elapsed
+	} else {
+		r["dns_working"] = false
+	}
+}
+
+// testTCPPorts tests connectivity to common TCP ports
+func (s *connectivitySensor) testTCPPorts(ctx context.Context, r map[string]interface{}) {
+	// Test HTTPS on a reliable web server
+	if reachable, latency := s.testTCPPort(ctx, "google.com", "443"); reachable {
+		r["tcp_443_reachable"] = true
+		r["tcp_443_latency_ms"] = latency
+	} else {
+		r["tcp_443_reachable"] = false
+	}
+
+	// Test DNS port on the configured DNS server
+	if reachable, latency := s.testTCPPort(ctx, s.cfg.InternetHost, "53"); reachable {
+		r["tcp_53_reachable"] = true
+		r["tcp_53_latency_ms"] = latency
+	} else {
+		r["tcp_53_reachable"] = false
+	}
+}
+
+// testTCPPort tests connectivity to a specific TCP port
+func (s *connectivitySensor) testTCPPort(ctx context.Context, host, port string) (bool, float64) {
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 1*time.Second)
 	elapsed := time.Since(start).Seconds() * 1000
 
 	if err == nil {
@@ -611,81 +522,8 @@ func (s *connectivitySensor) testTCPPort(ctx context.Context, host, port string)
 	return false, 0
 }
 
-func (s *connectivitySensor) ping(ctx context.Context, target string) (*float64, *float64) {
-	ctx2, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx2, "ping", "-c", strconv.Itoa(s.cfg.PingSamples), "-W", "1", target)
-	out, err := cmd.Output()
-
-	// Debug logging
-	s.logger.Debugw("ping result",
-		"target", target,
-		"error", err,
-		"output_len", len(out),
-		"output", string(out[:min(200, len(out))])) // First 200 characters
-
-	if len(out) == 0 {
-		// Try TCP fallback
-		return s.tcpPing(target)
-	}
-
-	output := string(out)
-
-	// Parse average latency
-	var latency *float64
-	if match := regexp.MustCompile(`min/avg/max/mdev = [\d.]+/([\d.]+)/`).FindStringSubmatch(output); len(match) > 1 {
-		if avg, err := strconv.ParseFloat(match[1], 64); err == nil {
-			latency = &avg
-		}
-	}
-
-	// Parse packet loss
-	var loss *float64
-	if match := regexp.MustCompile(`(\d+)% packet loss`).FindStringSubmatch(output); len(match) > 1 {
-		if pct, err := strconv.ParseFloat(match[1], 64); err == nil {
-			loss = &pct
-		}
-	}
-
-	// If we got output but no loss percentage, assume 0% if we have latency
-	if latency != nil && loss == nil {
-		zero := 0.0
-		loss = &zero
-	}
-
-	return latency, loss
-}
-
-func (s *connectivitySensor) tcpPing(target string) (*float64, *float64) {
-	// Try common ports
-	for _, port := range []string{"53", "80", "443"} {
-		var totalMs float64
-		var successes int
-
-		for i := 0; i < s.cfg.PingSamples; i++ {
-			start := time.Now()
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(target, port), 1*time.Second)
-			if err == nil {
-				conn.Close()
-				totalMs += float64(time.Since(start).Milliseconds())
-				successes++
-			}
-		}
-
-		if successes > 0 {
-			avg := totalMs / float64(successes)
-			loss := float64(s.cfg.PingSamples-successes) / float64(s.cfg.PingSamples) * 100
-			return &avg, &loss
-		}
-	}
-
-	// Total failure
-	loss := 100.0
-	return nil, &loss
-}
-
-func (s *connectivitySensor) determineRoute(r map[string]interface{}) string {
+// determineConnectivityStatus evaluates overall connectivity
+func (s *connectivitySensor) determineConnectivityStatus(r map[string]interface{}) string {
 	// Check gateway connectivity
 	gwLoss, gwOk := r["loss_gw_pct"].(float64)
 	if !gwOk || gwLoss > 50 {
@@ -701,17 +539,138 @@ func (s *connectivitySensor) determineRoute(r map[string]interface{}) string {
 	return "Internet"
 }
 
+// calculateSignalQuality converts RSSI to quality percentage
+func (s *connectivitySensor) calculateSignalQuality(rssi int) int {
+	// Excellent: > -50 dBm
+	// Good: -50 to -60 dBm
+	// Fair: -60 to -70 dBm
+	// Weak: < -70 dBm
+
+	if rssi >= -30 {
+		return 100
+	} else if rssi >= -67 {
+		return 100 - ((-30 - rssi) * 100 / 37) // Linear scale from 100% to ~20%
+	} else if rssi >= -90 {
+		return 20 - ((-67 - rssi) * 20 / 23) // Linear scale from 20% to 0%
+	}
+	return 0
+}
+
+// frequencyToChannel converts WiFi frequency to channel number
+func (s *connectivitySensor) frequencyToChannel(freq int) int {
+	// 2.4 GHz band
+	if freq >= 2412 && freq <= 2484 {
+		if freq == 2484 {
+			return 14
+		}
+		return (freq-2412)/5 + 1
+	}
+
+	// 5 GHz band
+	if freq >= 5180 && freq <= 5825 {
+		return (freq-5180)/5 + 36
+	}
+
+	return 0
+}
+
+// execCommand is a helper to execute commands with timeout
+func (s *connectivitySensor) execCommand(ctx context.Context, timeout time.Duration, name string, args ...string) []byte {
+	ctx2, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx2, name, args...).CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// runSpeedTest performs internet speed test
+func (s *connectivitySensor) runSpeedTest(ctx context.Context) (map[string]interface{}, error) {
+	if _, err := exec.LookPath("speedtest-cli"); err != nil {
+		return map[string]interface{}{
+			"error": "speedtest-cli not installed",
+		}, nil
+	}
+
+	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx2, "speedtest-cli", "--json").Output()
+	if err != nil {
+		return map[string]interface{}{
+			"error": fmt.Sprintf("speedtest failed: %v", err),
+		}, nil
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(out, &result); err != nil {
+		return map[string]interface{}{
+			"error": fmt.Sprintf("failed to parse speedtest output: %v", err),
+		}, nil
+	}
+
+	speedResult := map[string]interface{}{
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if download, ok := result["download"].(float64); ok {
+		speedResult["download_mbps"] = download / 1_000_000
+	}
+	if upload, ok := result["upload"].(float64); ok {
+		speedResult["upload_mbps"] = upload / 1_000_000
+	}
+	if ping, ok := result["ping"].(float64); ok {
+		speedResult["ping_ms"] = ping
+	}
+	if server, ok := result["server"].(map[string]interface{}); ok {
+		if sponsor, ok := server["sponsor"].(string); ok {
+			speedResult["server"] = sponsor
+		}
+		if location, ok := server["name"].(string); ok {
+			speedResult["location"] = location
+		}
+	}
+
+	return speedResult, nil
+}
+
+// DoCommand handles custom commands
 func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if cmdName, ok := cmd["command"].(string); ok {
 		switch cmdName {
+		case "ping":
+			// Allow custom ping target
+			target := s.cfg.InternetHost
+			if t, ok := cmd["target"].(string); ok && t != "" {
+				target = t
+			}
+			latency, loss := s.pingHost(ctx, target)
+			return map[string]interface{}{
+				"target":     target,
+				"latency_ms": latency,
+				"loss_pct":   loss,
+				"timestamp":  time.Now().UTC().Format(time.RFC3339),
+			}, nil
+		case "traceroute":
+			// Run traceroute for network path debugging
+			target := s.cfg.InternetHost
+			if t, ok := cmd["target"].(string); ok && t != "" {
+				target = t
+			}
+			out := s.execCommand(ctx, 10*time.Second, "traceroute", "-w", "1", "-m", "10", target)
+			return map[string]interface{}{
+				"target":    target,
+				"output":    string(out),
+				"timestamp": time.Now().UTC().Format(time.RFC3339),
+			}, nil
 		case "debug":
 			// Force fresh reading without cache
-			return s.collectSimple(ctx), nil
-
+			return s.collectDiagnostics(ctx), nil
 		case "speedtest":
-			// Run speed test (speedtest-cli)
+			// Run speed test
 			return s.runSpeedTest(ctx)
-
 		default:
 			return nil, fmt.Errorf("unknown command: %s", cmdName)
 		}
@@ -719,6 +678,7 @@ func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]inter
 	return nil, fmt.Errorf("no command specified")
 }
 
+// Close cleans up resources
 func (s *connectivitySensor) Close(context.Context) error {
 	return nil
 }
