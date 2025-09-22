@@ -1,8 +1,8 @@
-# Module connectivity 
+# Link Diagnostics Module 
 
 Provide a description of the purpose of the module and any relevant information.
 
-## Model hunter:connectivity:sensor
+## Model hunter:link-diagnostics:sensor
 
 Provide a description of the model and any relevant information.
 
