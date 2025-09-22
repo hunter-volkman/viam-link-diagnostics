@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	link_diagnostics "link-diagnostics"
 
 	sensor "go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
@@ -22,9 +23,9 @@ func realMain() error {
 	deps := resource.Dependencies{}
 	// can load these from a remote machine if you need
 
-	cfg := link - diagnostics.Config{}
+	cfg := link_diagnostics.Config{}
 
-	thing, err := link - diagnostics.NewSensor(ctx, deps, sensor.Named("foo"), &cfg, logger)
+	thing, err := link_diagnostics.NewSensor(ctx, deps, sensor.Named("foo"), &cfg, logger)
 	if err != nil {
 		return err
 	}
