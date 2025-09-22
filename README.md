@@ -1,10 +1,10 @@
 # Link Diagnostics Module 
 
-A Viam `sensor` component for network connectivity monitoring and diagnostics.
+A Viam `sensor` component for link diagnostics and connectivity monitoring.
 
 ## Model hunter:link-diagnostics:sensor
 
-This model implements the `rdk:component:sensor` API to provide real-time network diagnostics including Wi-Fi signal quality, connectivity tests, packet loss statistics, and network performance metrics.
+This model implements the `rdk:component:sensor` API to provide real-time link diagnostics including Wi-Fi signal quality, connectivity tests, packet loss statistics, and network performance metrics.
 
 ### Configuration
 The following attribute template can be used to configure this model:
