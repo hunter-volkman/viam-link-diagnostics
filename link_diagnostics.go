@@ -636,6 +636,43 @@ func (s *connectivitySensor) runSpeedTest(ctx context.Context) (map[string]inter
 	return speedResult, nil
 }
 
+// runTraceroute executes traceroute to a target host
+func (s *connectivitySensor) runTraceroute(ctx context.Context, target string) (map[string]interface{}, error) {
+	// Check if traceroute is installed
+	if _, err := exec.LookPath("traceroute"); err != nil {
+		return map[string]interface{}{
+			"error": "traceroute not installed",
+			"hint":  "Install with: sudo apt-get install traceroute",
+		}, nil
+	}
+
+	// Validate target
+	if target == "" {
+		target = s.cfg.InternetHost
+	}
+
+	// Run traceroute with reasonable limits
+	out := s.execCommand(ctx, 10*time.Second,
+		"traceroute",
+		"-w", "1", // 1 second timeout per hop
+		"-m", "10", // max 10 hops
+		target)
+
+	if out == nil {
+		return map[string]interface{}{
+			"error":     "traceroute failed",
+			"target":    target,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		}, nil
+	}
+
+	return map[string]interface{}{
+		"target":    target,
+		"output":    string(out),
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
 // DoCommand handles custom commands
 func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if cmdName, ok := cmd["command"].(string); ok {
@@ -653,24 +690,22 @@ func (s *connectivitySensor) DoCommand(ctx context.Context, cmd map[string]inter
 				"loss_pct":   loss,
 				"timestamp":  time.Now().UTC().Format(time.RFC3339),
 			}, nil
+
 		case "traceroute":
-			// Run traceroute for network path debugging
 			target := s.cfg.InternetHost
 			if t, ok := cmd["target"].(string); ok && t != "" {
 				target = t
 			}
-			out := s.execCommand(ctx, 10*time.Second, "traceroute", "-w", "1", "-m", "10", target)
-			return map[string]interface{}{
-				"target":    target,
-				"output":    string(out),
-				"timestamp": time.Now().UTC().Format(time.RFC3339),
-			}, nil
+			return s.runTraceroute(ctx, target)
+
 		case "debug":
 			// Force fresh reading without cache
 			return s.collectDiagnostics(ctx), nil
+
 		case "speedtest":
 			// Run speed test
 			return s.runSpeedTest(ctx)
+
 		default:
 			return nil, fmt.Errorf("unknown command: %s", cmdName)
 		}
