@@ -282,8 +282,7 @@ func (s *connectivitySensor) collectInterfaceStats(ctx context.Context, iface st
 	// Calculate drop rates
 	if rxPackets, ok := r["rx_packets"].(int64); ok {
 		if rxDropped, ok := r["rx_dropped"].(int64); ok && rxPackets > 0 {
-			total := rxPackets + rxDropped
-			dropRate := float64(rxDropped) / float64(total) * 100
+			dropRate := float64(rxDropped) / float64(rxPackets) * 100
 			r["rx_drop_rate_pct"] = dropRate
 		}
 	}
