@@ -3,7 +3,7 @@
   "module_id": "hunter:link-diagnostics",
   "visibility": "private",
   "url": "https://github.com/hunter-volkman/viam-link-diagnostics",
-  "description": "Sensor component for Wi-Fi or Ethernet link",
+  "description": "Monitor network link health and diagnostics for Wi-Fi and Ethernet connections",
   "models": [
     {
       "api": "rdk:component:sensor",
